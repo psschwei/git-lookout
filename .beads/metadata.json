@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "server",
+  "dolt_database": "git_lookout",
+  "project_id": "263129af-e132-4802-8ba0-26673c998c87"
+}

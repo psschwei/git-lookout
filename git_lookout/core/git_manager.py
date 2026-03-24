@@ -72,15 +72,10 @@ class BareCloneManager:
 
         if result.returncode != 0:
             conflicting_files = _parse_conflicting_files(result.stdout)
-            # Get conflict regions by re-running without --name-only
-            detail = subprocess.run(
-                ["git", "merge-tree", "--write-tree",
-                 pr_a.head_sha, pr_b.head_sha],
-                cwd=path,
-                capture_output=True,
-                text=True,
+            merged_tree_sha = result.stdout.splitlines()[0].strip()
+            conflict_regions = _extract_conflict_regions(
+                path, merged_tree_sha, conflicting_files
             )
-            conflict_regions = _parse_conflict_regions(detail.stdout, conflicting_files)
 
         return ConflictResult(
             pr_a=pr_a,
@@ -101,9 +96,6 @@ def file_overlap(files_a: list[str], files_b: list[str]) -> list[str]:
 # Matches "CONFLICT (content): Merge conflict in <file>" lines
 _CONFLICT_LINE_RE = re.compile(r"^CONFLICT \([^)]+\): .+ in (.+)$", re.MULTILINE)
 
-# Matches hunk headers like: @@ -10,7 +10,7 @@
-_HUNK_RE = re.compile(r"^@@\s+-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s+@@", re.MULTILINE)
-
 
 def _parse_conflicting_files(output: str) -> list[str]:
     """
@@ -113,34 +105,57 @@ def _parse_conflicting_files(output: str) -> list[str]:
     return _CONFLICT_LINE_RE.findall(output)
 
 
-def _parse_conflict_regions(output: str, conflicting_files: list[str]) -> list[ConflictRegion]:
+def _extract_conflict_regions(
+    repo_path: Path, merged_tree_sha: str, conflicting_files: list[str]
+) -> list[ConflictRegion]:
     """
-    Parse conflict hunk positions from full git merge-tree output.
-    Sections are split by "diff --cc <file>" headers.
-    """
-    conflict_regions: list[ConflictRegion] = []
-    sections = re.split(r"^diff --(?:cc|git a/\S+ b/) ", output, flags=re.MULTILINE)
+    Read each conflicting file from the merged tree (which contains inline
+    conflict markers) and convert the marker positions to ConflictRegion objects.
 
-    for section in sections[1:]:
-        lines = section.splitlines()
-        if not lines:
+    git merge-tree --write-tree leaves conflict markers in the merged blob:
+        <<<<<<< <ours-sha>
+        ... ours ...
+        =======
+        ... theirs ...
+        >>>>>>> <theirs-sha>
+
+    We scan the blob line-by-line to locate each hunk.
+    """
+    regions: list[ConflictRegion] = []
+
+    for filename in conflicting_files:
+        result = subprocess.run(
+            ["git", "show", f"{merged_tree_sha}:{filename}"],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
             continue
 
-        filename = lines[0].strip()
-        if filename not in conflicting_files:
-            continue
+        ours_start: int | None = None
+        separator: int | None = None
 
-        for match in _HUNK_RE.finditer(section):
-            ours_start = int(match.group(1))
-            theirs_start = int(match.group(2))
-            conflict_regions.append(
-                ConflictRegion(
-                    file=filename,
-                    ours_start=ours_start,
-                    ours_end=ours_start,
-                    theirs_start=theirs_start,
-                    theirs_end=theirs_start,
+        for lineno, line in enumerate(result.stdout.splitlines(), start=1):
+            if line.startswith("<<<<<<<"):
+                ours_start = lineno
+                separator = None
+            elif line.startswith("=======") and ours_start is not None:
+                separator = lineno
+            elif line.startswith(">>>>>>>") and ours_start is not None and separator is not None:
+                ours_end = separator - 1
+                theirs_start = separator + 1
+                theirs_end = lineno - 1
+                regions.append(
+                    ConflictRegion(
+                        file=filename,
+                        ours_start=ours_start,
+                        ours_end=ours_end,
+                        theirs_start=theirs_start,
+                        theirs_end=theirs_end,
+                    )
                 )
-            )
+                ours_start = None
+                separator = None
 
-    return conflict_regions
+    return regions

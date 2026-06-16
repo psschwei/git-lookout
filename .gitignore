@@ -2,3 +2,9 @@
 # Dolt database files (added by bd init)
 .dolt/
 *.db
+
+# Python / tooling artifacts
+__pycache__/
+*.pyc
+.venv/
+uv.lock

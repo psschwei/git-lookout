@@ -96,3 +96,62 @@ def test_fetch_ref(manager: BareCloneManager, source_repo: Path):
         ["git", "branch"], cwd=bare, capture_output=True, text=True
     )
     assert "feature-x" in result.stdout
+
+
+def _branch_with_files(repo: Path, branch: str, files: dict[str, str]) -> None:
+    """Create `branch` off the current HEAD, write `files`, and commit."""
+    subprocess.run(["git", "checkout", "-b", branch], cwd=repo, check=True)
+    for name, content in files.items():
+        path = repo / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", f"{branch} commit"], cwd=repo, check=True)
+
+
+def test_resolve_sha(manager: BareCloneManager, source_repo: Path):
+    manager.ensure_clone("acme", "widget", str(source_repo))
+    _branch_with_files(source_repo, "feature-x", {"feature.txt": "x"})
+    manager.fetch_ref("acme", "widget", "feature-x")
+
+    sha = manager.resolve_sha("acme", "widget", "feature-x")
+
+    # 40-char hex SHA matching what the source repo reports for the branch.
+    expected = subprocess.run(
+        ["git", "rev-parse", "feature-x"],
+        cwd=source_repo,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert sha == expected
+
+
+def test_resolve_sha_unknown_ref_raises(
+    manager: BareCloneManager, source_repo: Path
+):
+    manager.ensure_clone("acme", "widget", str(source_repo))
+    with pytest.raises(subprocess.CalledProcessError):
+        manager.resolve_sha("acme", "widget", "does-not-exist")
+
+
+def test_changed_files_against_base(
+    manager: BareCloneManager, source_repo: Path
+):
+    # Default branch already has README.md (from the source_repo fixture).
+    base = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=source_repo,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    manager.ensure_clone("acme", "widget", str(source_repo))
+
+    _branch_with_files(
+        source_repo, "feature-x", {"a.txt": "a", "dir/b.txt": "b"}
+    )
+    manager.fetch_ref("acme", "widget", base)
+    manager.fetch_ref("acme", "widget", "feature-x")
+
+    files = manager.changed_files("acme", "widget", "feature-x", base)
+
+    assert set(files) == {"a.txt", "dir/b.txt"}

@@ -165,6 +165,73 @@ def test_list_tracked_prs_keyed_by_number():
     assert tracked[10]["head_sha"] == "s10"
 
 
+# ---- prs_overlapping_files ------------------------------------------------
+
+
+def _pr_with_files(
+    conn: sqlite3.Connection, repo_id: int, number: int, files: list[str]
+) -> int:
+    pr_id = queries.upsert_pull_request(
+        conn,
+        repo_id,
+        pr_number=number,
+        head_sha=f"sha{number}",
+        base_branch="main",
+        title=f"PR {number}",
+        author="octocat",
+        updated_at="2026-06-16T00:00:00Z",
+    )
+    queries.replace_pr_files(conn, pr_id, files)
+    conn.commit()
+    return pr_id
+
+
+def test_overlapping_returns_prs_sharing_a_file():
+    conn = connect(":memory:")
+    repo_id = _repo(conn)
+    _pr_with_files(conn, repo_id, 1, ["api.py", "db.py"])
+    _pr_with_files(conn, repo_id, 2, ["web.py"])
+
+    rows = queries.prs_overlapping_files(conn, repo_id, ["api.py", "other.py"])
+
+    assert {r["pr_number"] for r in rows} == {1}
+
+
+def test_overlapping_dedups_pr_sharing_multiple_files():
+    conn = connect(":memory:")
+    repo_id = _repo(conn)
+    _pr_with_files(conn, repo_id, 1, ["api.py", "db.py"])
+
+    rows = queries.prs_overlapping_files(conn, repo_id, ["api.py", "db.py"])
+
+    # PR 1 touches both queried files but must appear exactly once.
+    assert [r["pr_number"] for r in rows] == [1]
+
+
+def test_overlapping_empty_input_returns_empty():
+    conn = connect(":memory:")
+    repo_id = _repo(conn)
+    _pr_with_files(conn, repo_id, 1, ["api.py"])
+
+    assert queries.prs_overlapping_files(conn, repo_id, []) == []
+
+
+def test_overlapping_scoped_to_repo():
+    conn = connect(":memory:")
+    repo_a = _repo(conn, repo_id=1)
+    conn.execute(
+        "INSERT INTO repositories (id, owner, name, installation_id) "
+        "VALUES (2, 'acme', 'other', 99)"
+    )
+    conn.commit()
+    _pr_with_files(conn, repo_a, 1, ["shared.py"])
+    _pr_with_files(conn, 2, 2, ["shared.py"])
+
+    rows = queries.prs_overlapping_files(conn, repo_a, ["shared.py"])
+
+    assert {r["pr_number"] for r in rows} == {1}
+
+
 # ---- delete_pull_request --------------------------------------------------
 
 

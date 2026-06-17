@@ -43,6 +43,44 @@ class BareCloneManager:
             check=True,
         )
 
+    def resolve_sha(self, owner: str, repo: str, ref: str) -> str:
+        """
+        Resolve a branch ref to its commit SHA in the bare clone.
+
+        The ref must already have been fetched (see :meth:`fetch_ref`). Raises
+        ``subprocess.CalledProcessError`` if the ref does not exist.
+        """
+        path = self.repo_path(owner, repo)
+        result = subprocess.run(
+            ["git", "rev-parse", f"refs/heads/{ref}"],
+            cwd=path,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout.strip()
+
+    def changed_files(
+        self, owner: str, repo: str, ref: str, base_branch: str
+    ) -> list[str]:
+        """
+        List the files ``ref`` changes relative to ``base_branch``.
+
+        Uses ``git diff --name-only <base>...<ref>`` (three-dot), which diffs the
+        ref against the merge-base of the two branches — the same set of changed
+        files a pull request would report, not every difference between the two
+        tips. Both refs must already exist in the bare clone.
+        """
+        path = self.repo_path(owner, repo)
+        result = subprocess.run(
+            ["git", "diff", "--name-only", f"{base_branch}...{ref}"],
+            cwd=path,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return [line for line in result.stdout.splitlines() if line]
+
     def merge_tree(
         self,
         owner: str,

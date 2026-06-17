@@ -35,6 +35,36 @@ def list_tracked_prs(
     return {row["pr_number"]: row for row in rows}
 
 
+def prs_overlapping_files(
+    conn: sqlite3.Connection, repo_id: int, file_paths: Iterable[str]
+) -> list[sqlite3.Row]:
+    """
+    Return the repo's tracked PRs that touch at least one of ``file_paths``.
+
+    This is the file-overlap pre-filter the API check runs before any git
+    operations: only PRs sharing a changed file with the candidate ref can
+    possibly conflict, so the expensive merge-tree pass is limited to these.
+
+    Each PR appears once even when it shares several files (DISTINCT). An empty
+    ``file_paths`` yields no rows without touching the database. The query rides
+    the ``idx_pr_files_path`` index on ``pr_files.file_path``.
+    """
+    paths = list(file_paths)
+    if not paths:
+        return []
+
+    placeholders = ",".join("?" for _ in paths)
+    return conn.execute(
+        f"""
+        SELECT DISTINCT pr.*
+        FROM pull_requests pr
+        JOIN pr_files pf ON pf.pr_id = pr.id
+        WHERE pr.repo_id = ? AND pf.file_path IN ({placeholders})
+        """,
+        (repo_id, *paths),
+    ).fetchall()
+
+
 def upsert_pull_request(
     conn: sqlite3.Connection,
     repo_id: int,

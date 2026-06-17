@@ -101,6 +101,44 @@ class AppAuth:
         self._client.close()
 
 
+def repo_access(
+    token: str,
+    owner: str,
+    repo: str,
+    *,
+    client: httpx.Client | None = None,
+) -> bool:
+    """
+    Check whether a *caller-supplied* GitHub token grants access to a repo.
+
+    This is the API endpoint's authorization gate, and is independent of the
+    GitHub App credentials in :class:`AppAuth`: the caller proves they can see
+    ``owner/repo`` by presenting their own token, which we test against
+    ``GET /repos/{owner}/{repo}``. GitHub returns 200 when the token can read the
+    repo and 401/403/404 (404 hides private repos from unauthorized callers)
+    otherwise — all of which mean "no access" here.
+
+    A transport-level failure propagates; only authentication/authorization
+    statuses are folded into the ``False`` result.
+    """
+    own_client = client is None
+    if client is None:
+        client = httpx.Client(base_url=GITHUB_API, timeout=30.0)
+    try:
+        resp = client.get(
+            f"/repos/{owner}/{repo}",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+        )
+    finally:
+        if own_client:
+            client.close()
+    return resp.status_code == 200
+
+
 def _parse_github_timestamp(value: str) -> datetime:
     """Parse a GitHub ISO-8601 timestamp (e.g. '2026-06-16T01:02:03Z') as UTC."""
     return datetime.fromisoformat(value.replace("Z", "+00:00"))

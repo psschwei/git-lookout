@@ -6,7 +6,7 @@ import httpx
 import jwt
 import pytest
 
-from git_lookout.github.auth import AppAuth, InstallationToken
+from git_lookout.github.auth import AppAuth, InstallationToken, repo_access
 
 
 def _now_iso(delta_seconds: int) -> str:
@@ -122,3 +122,31 @@ def test_failed_token_request_raises(rsa_keypair):
     auth = AppAuth("1", private_pem, client=_mock_token_client(handler))
     with pytest.raises(httpx.HTTPStatusError):
         auth.installation_token(42)
+
+
+# ---- repo_access ----------------------------------------------------------
+
+
+def test_repo_access_true_on_200():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["auth"] = request.headers["Authorization"]
+        return httpx.Response(200, json={"full_name": "acme/widgets"})
+
+    assert repo_access(
+        "gho_caller", "acme", "widgets", client=_mock_token_client(handler)
+    ) is True
+    assert captured["url"].endswith("/repos/acme/widgets")
+    assert captured["auth"] == "Bearer gho_caller"
+
+
+@pytest.mark.parametrize("status", [401, 403, 404])
+def test_repo_access_false_on_auth_failure(status):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, json={"message": "no"})
+
+    assert repo_access(
+        "gho_caller", "acme", "widgets", client=_mock_token_client(handler)
+    ) is False

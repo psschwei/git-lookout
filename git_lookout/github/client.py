@@ -92,6 +92,48 @@ class GitHubClient:
             files.append(entry["filename"])
         return files
 
+    def get_pull_request(
+        self, owner: str, repo: str, pr_number: int
+    ) -> PullRequest:
+        """Fetch a single pull request's metadata."""
+        resp = self._client.get(
+            f"/repos/{owner}/{repo}/pulls/{pr_number}",
+            headers=self._headers(),
+        )
+        resp.raise_for_status()
+        return _parse_pull_request(resp.json())
+
+    def create_issue_comment(
+        self, owner: str, repo: str, pr_number: int, body: str
+    ) -> int:
+        """
+        Post a comment on a PR and return its comment id.
+
+        A PR comment is an *issue* comment in GitHub's data model (PRs are issues
+        with code), so this hits the issues comments endpoint — the same id can
+        later be updated via :meth:`update_issue_comment`. The id is stored in
+        conflict_checks so subsequent checks update this comment in place rather
+        than posting a duplicate.
+        """
+        resp = self._client.post(
+            f"/repos/{owner}/{repo}/issues/{pr_number}/comments",
+            json={"body": body},
+            headers=self._headers(),
+        )
+        resp.raise_for_status()
+        return resp.json()["id"]
+
+    def update_issue_comment(
+        self, owner: str, repo: str, comment_id: int, body: str
+    ) -> None:
+        """Edit an existing issue/PR comment in place by its id."""
+        resp = self._client.patch(
+            f"/repos/{owner}/{repo}/issues/comments/{comment_id}",
+            json={"body": body},
+            headers=self._headers(),
+        )
+        resp.raise_for_status()
+
     def _paginate(self, path: str, params: dict | None = None):
         """
         Yield items across all pages of a list endpoint.

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 
@@ -141,6 +143,63 @@ def test_error_response_raises():
 
     with pytest.raises(httpx.HTTPStatusError):
         _client(handler).list_open_prs("acme", "widgets")
+
+
+# ---- get_pull_request -----------------------------------------------------
+
+
+def test_get_pull_request_parses_single_pr():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/repos/acme/widgets/pulls/42"
+        return httpx.Response(200, json=_pr_payload(42))
+
+    pr = _client(handler).get_pull_request("acme", "widgets", 42)
+    assert pr.number == 42
+    assert pr.base_ref == "main"
+
+
+# ---- create_issue_comment / update_issue_comment -------------------------
+
+
+def test_create_issue_comment_posts_and_returns_id():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["path"] = request.url.path
+        seen["body"] = json.loads(request.content)["body"]
+        return httpx.Response(201, json={"id": 12345})
+
+    comment_id = _client(handler).create_issue_comment(
+        "acme", "widgets", 42, "hello"
+    )
+    assert comment_id == 12345
+    assert seen["method"] == "POST"
+    assert seen["path"] == "/repos/acme/widgets/issues/42/comments"
+    assert seen["body"] == "hello"
+
+
+def test_update_issue_comment_patches_existing():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["path"] = request.url.path
+        seen["body"] = json.loads(request.content)["body"]
+        return httpx.Response(200, json={"id": 12345})
+
+    _client(handler).update_issue_comment("acme", "widgets", 12345, "edited")
+    assert seen["method"] == "PATCH"
+    assert seen["path"] == "/repos/acme/widgets/issues/comments/12345"
+    assert seen["body"] == "edited"
+
+
+def test_create_issue_comment_raises_on_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, json={"message": "Forbidden"})
+
+    with pytest.raises(httpx.HTTPStatusError):
+        _client(handler).create_issue_comment("acme", "widgets", 42, "x")
 
 
 # ---- _next_link -----------------------------------------------------------

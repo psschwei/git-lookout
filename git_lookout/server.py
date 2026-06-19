@@ -4,14 +4,16 @@ import asyncio
 import logging
 import os
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
 import uvicorn
-from fastapi import Depends, FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
+from git_lookout import handlers
 from git_lookout.core.git_manager import BareCloneManager
 from git_lookout.core.models import ConflictResult, PRInfo
 from git_lookout.core.pipeline import run_pipeline
@@ -19,6 +21,8 @@ from git_lookout.github import auth as gh_auth
 from git_lookout.github.auth import GITHUB_API, AppAuth
 from git_lookout.storage import queries, schema
 from git_lookout.sweep import app_client_factory, reconcile_all
+from git_lookout.webhook.events import PullRequestEvent, parse_pull_request_event
+from git_lookout.webhook.signature import verify_signature
 
 log = logging.getLogger(__name__)
 
@@ -33,6 +37,10 @@ _manager: BareCloneManager | None = None
 # without a shared-connection lock.
 _db_path: str | None = None
 _auth: AppAuth | None = None
+# The GitHub App webhook secret, used to verify X-Hub-Signature-256 on each
+# delivery. None disables the webhook endpoint (returns 503) — there is no safe
+# way to accept unsigned deliveries.
+_webhook_secret: str | None = None
 _sweep_task: asyncio.Task | None = None
 # A plain httpx client used only to validate caller-supplied GitHub tokens. It is
 # independent of the GitHub App credentials, so /api/check auth works even when
@@ -73,7 +81,7 @@ class CheckResponse(BaseModel):
 
 @app.on_event("startup")
 async def startup() -> None:
-    global _manager, _db_path, _auth, _sweep_task, _validator_client
+    global _manager, _db_path, _auth, _webhook_secret, _sweep_task, _validator_client
 
     repo_dir = os.environ.get("REPO_CACHE_DIR", "/tmp/git-lookout/repos")
     _manager = BareCloneManager(base_path=Path(repo_dir))
@@ -84,6 +92,10 @@ async def startup() -> None:
     schema.connect(_db_path).close()
 
     _validator_client = httpx.Client(base_url=GITHUB_API, timeout=30.0)
+
+    _webhook_secret = os.environ.get("GITHUB_WEBHOOK_SECRET") or None
+    if _webhook_secret is None:
+        log.warning("GITHUB_WEBHOOK_SECRET not set; /webhook will reject deliveries")
 
     _auth = _build_auth()
     if _auth is None:
@@ -283,6 +295,91 @@ def _to_conflict_out(pr: PRInfo, result: ConflictResult) -> ConflictOut:
             for r in result.conflict_regions
         ],
     )
+
+
+@app.post("/webhook")
+async def webhook(
+    request: Request,
+    x_github_event: str | None = Header(default=None),
+    x_hub_signature_256: str | None = Header(default=None),
+) -> Response:
+    """
+    Receive a GitHub App webhook delivery (the passive monitoring path).
+
+    Verifies the HMAC signature against ``GITHUB_WEBHOOK_SECRET``, then — only for
+    ``pull_request`` events — parses the payload and reconciles the triggering PR
+    against its overlapping open PRs, posting/updating/resolving conflict comments.
+    All event-handling I/O (git, SQLite, GitHub API) runs in a worker thread.
+
+    Status codes:
+      503 — webhook secret not configured (can't verify anything)
+      401 — missing or invalid signature
+      400 — malformed pull_request payload
+      202 — handled (or accepted-and-ignored for non-actionable events)
+    """
+    if _webhook_secret is None:
+        raise HTTPException(status_code=503, detail="webhook secret not configured")
+
+    body = await request.body()
+    if not verify_signature(_webhook_secret, body, x_hub_signature_256):
+        raise HTTPException(status_code=401, detail="invalid signature")
+
+    # Non-PR events (ping, installation, push, …) are accepted and ignored — the
+    # signature was valid, there is just nothing for us to do.
+    if x_github_event != "pull_request":
+        return Response(status_code=202)
+
+    try:
+        payload = await request.json()
+    except Exception as exc:  # malformed JSON body
+        raise HTTPException(status_code=400, detail="invalid JSON") from exc
+
+    event = parse_pull_request_event(payload)
+    if event is None:
+        raise HTTPException(status_code=400, detail="invalid pull_request payload")
+
+    if _auth is None:
+        # Without App credentials we can't fetch the clone or post comments. The
+        # sweep is already disabled in this mode; surface it rather than 500.
+        raise HTTPException(
+            status_code=503, detail="GitHub App credentials not configured"
+        )
+
+    await asyncio.to_thread(_handle_webhook_event, event)
+    return Response(status_code=202)
+
+
+def _handle_webhook_event(event: PullRequestEvent) -> None:
+    """
+    Handle one pull_request event on a connection owned by this worker thread.
+
+    Builds an installation-scoped GitHub client and the matching authenticated
+    clone URL, then hands off to the platform-agnostic handler. SQLite
+    connections are thread-bound, so this opens (and closes) its own.
+    """
+    client = app_client_factory(_auth)(event.installation_id)
+    token = _auth.installation_token(event.installation_id)
+    clone_url = _clone_url(token, event.repo_owner, event.repo_name)
+    now = datetime.now(timezone.utc).isoformat()
+
+    conn = schema.connect(_db_path)
+    try:
+        handlers.handle_pull_request_event(
+            conn, _manager, client, event, clone_url=clone_url, now=now
+        )
+    finally:
+        conn.close()
+
+
+def _clone_url(token: str, owner: str, name: str) -> str:
+    """
+    Build an installation-authenticated HTTPS clone URL.
+
+    GitHub accepts an installation token as the password with the literal
+    username ``x-access-token`` for git-over-HTTPS, which is how the bare clone
+    fetches private repos without storing long-lived credentials on disk.
+    """
+    return f"https://x-access-token:{token}@github.com/{owner}/{name}.git"
 
 
 @app.get("/health")

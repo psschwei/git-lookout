@@ -256,3 +256,118 @@ def test_delete_pull_request_cascades_to_files():
 
     assert conn.execute("SELECT COUNT(*) FROM pull_requests").fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM pr_files").fetchone()[0] == 0
+
+
+# ---- conflict_checks ------------------------------------------------------
+
+
+def test_get_conflict_check_missing_returns_none():
+    conn = connect(":memory:")
+    repo_id = _repo(conn)
+    assert queries.get_conflict_check(conn, repo_id, 1, 2) is None
+
+
+def test_upsert_conflict_check_canonicalizes_pair_order():
+    # Insert with the higher number first; it must be stored as (lo, hi).
+    conn = connect(":memory:")
+    repo_id = _repo(conn)
+    queries.upsert_conflict_check(
+        conn,
+        repo_id,
+        pr_a=7,
+        pr_b=3,
+        sha_a="sha7",
+        sha_b="sha3",
+        status="conflict",
+        conflicting_files=["x.py"],
+        comment_id_a=700,
+        comment_id_b=300,
+        checked_at="2026-06-16T00:00:00Z",
+    )
+    conn.commit()
+    row = queries.get_conflict_check(conn, repo_id, 3, 7)
+    assert row["pr_a_number"] == 3 and row["pr_b_number"] == 7
+    # SHAs and comment ids follow the canonical swap: a→3, b→7.
+    assert row["pr_a_sha"] == "sha3" and row["pr_b_sha"] == "sha7"
+    assert row["comment_id_a"] == 300 and row["comment_id_b"] == 700
+    assert row["conflicting_files"] == '["x.py"]'
+
+
+def test_get_conflict_check_is_order_independent():
+    conn = connect(":memory:")
+    repo_id = _repo(conn)
+    queries.upsert_conflict_check(
+        conn, repo_id, pr_a=3, pr_b=7, sha_a="a", sha_b="b",
+        status="clean", conflicting_files=[], comment_id_a=None,
+        comment_id_b=None, checked_at="2026-06-16T00:00:00Z",
+    )
+    conn.commit()
+    assert queries.get_conflict_check(conn, repo_id, 3, 7)["id"] == \
+        queries.get_conflict_check(conn, repo_id, 7, 3)["id"]
+
+
+def test_upsert_conflict_check_updates_in_place():
+    conn = connect(":memory:")
+    repo_id = _repo(conn)
+    first = queries.upsert_conflict_check(
+        conn, repo_id, pr_a=1, pr_b=2, sha_a="old1", sha_b="old2",
+        status="conflict", conflicting_files=["a.py"], comment_id_a=10,
+        comment_id_b=20, checked_at="2026-06-16T00:00:00Z",
+    )
+    second = queries.upsert_conflict_check(
+        conn, repo_id, pr_a=1, pr_b=2, sha_a="new1", sha_b="old2",
+        status="clean", conflicting_files=[], comment_id_a=10,
+        comment_id_b=20, checked_at="2026-06-16T01:00:00Z",
+    )
+    conn.commit()
+    assert first == second  # same row id — upsert, not insert
+    assert conn.execute("SELECT COUNT(*) FROM conflict_checks").fetchone()[0] == 1
+    row = queries.get_conflict_check(conn, repo_id, 1, 2)
+    assert row["status"] == "clean" and row["pr_a_sha"] == "new1"
+
+
+def test_conflict_checks_for_pr_matches_either_side():
+    conn = connect(":memory:")
+    repo_id = _repo(conn)
+    queries.upsert_conflict_check(
+        conn, repo_id, pr_a=1, pr_b=2, sha_a="a", sha_b="b", status="conflict",
+        conflicting_files=[], comment_id_a=None, comment_id_b=None,
+        checked_at="t",
+    )
+    queries.upsert_conflict_check(
+        conn, repo_id, pr_a=2, pr_b=3, sha_a="b", sha_b="c", status="clean",
+        conflicting_files=[], comment_id_a=None, comment_id_b=None,
+        checked_at="t",
+    )
+    conn.commit()
+    rows = queries.conflict_checks_for_pr(conn, repo_id, 2)
+    assert len(rows) == 2  # PR 2 is in both pairs
+    assert queries.conflict_checks_for_pr(conn, repo_id, 1) and \
+        len(queries.conflict_checks_for_pr(conn, repo_id, 1)) == 1
+
+
+def test_delete_conflict_check_removes_row():
+    conn = connect(":memory:")
+    repo_id = _repo(conn)
+    check_id = queries.upsert_conflict_check(
+        conn, repo_id, pr_a=1, pr_b=2, sha_a="a", sha_b="b", status="clean",
+        conflicting_files=[], comment_id_a=None, comment_id_b=None,
+        checked_at="t",
+    )
+    conn.commit()
+    queries.delete_conflict_check(conn, check_id)
+    conn.commit()
+    assert conn.execute("SELECT COUNT(*) FROM conflict_checks").fetchone()[0] == 0
+
+
+def test_get_pull_request_by_number():
+    conn = connect(":memory:")
+    repo_id = _repo(conn)
+    queries.upsert_pull_request(
+        conn, repo_id, pr_number=9, head_sha="abc", base_branch="main",
+        title="t", author="a", updated_at="t",
+    )
+    conn.commit()
+    row = queries.get_pull_request(conn, repo_id, 9)
+    assert row is not None and row["head_sha"] == "abc"
+    assert queries.get_pull_request(conn, repo_id, 999) is None
